@@ -1,0 +1,55 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Environment files
+.env
+.env.*
+
+# Editor and OS-specific files
+.DS_Store
+.idea/
+.vscode/
+Thumbs.db
+
+# Logs and local dev files
+*.log
+*.sqlite3
+*.db
+
+# Node modules (if JS used)
+node_modules/
+
+# Output / build folders
+dist/
+build/
+*.egg-info/
+
+# CI/CD related
+.coverage
+coverage.xml
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+junit.xml
+nosetests.xml
+test-results/
+reports/
+
+# GitHub Actions
+.github/token
+.github/secrets.env
+
+# GitLab CI
+.gitlab-ci.yml.swp
+.gitlab-ci-local/
+
+# Jenkins
+.jenkins/
+workspace/
