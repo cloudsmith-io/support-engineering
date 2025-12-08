@@ -16,10 +16,6 @@ fi
 CHECK='✅'; CROSS='❌'; TIMER='⏳'; VULN='☠️'
 case ${LC_ALL:-${LC_CTYPE:-$LANG}} in *UTF-8*|*utf8*) : ;; *) CHECK='OK'; CROSS='X' ;; esac
 
-# Table Format
-TBL_FMT="| %-20s | %-15s | %-30s | %-10s | %-75s |\n"
-SEP_LINE="+----------------------+-----------------+--------------------------------+------------+-----------------------------------------------------------------------------+"
-
 completed() { printf '%s%s%s %s\n' "$GREEN" "$CHECK" "$RESET" "$*"; }
 progress()  { printf '%s%s%s %s\n' "$YELLOW" "$TIMER" "$RESET" "$*"; }
 quarantined() { printf '%s%s%s %s\n' "$ORANGE" "$VULN" "$RESET" "$*"; }
@@ -34,7 +30,7 @@ if [[ -z "${CLOUDSMITH_URL}" ]]; then
   CLOUDSMITH_URL="https://docker.cloudsmith.io"
 fi
 
-# authorization header
+# uthorization header
 AUTH_HEADER=()
 if [[ -n "${CLOUDSMITH_API_KEY:-}" ]]; then
   AUTH_HEADER=(-H "Authorization: Bearer ${CLOUDSMITH_API_KEY}")
@@ -85,12 +81,9 @@ getDigestData () {
     ' <<< "${MANIFEST_JSON}" | awk 'NF' | sort -u)
 
     if (( ${#ARCHS[@]} == 0 )); then
-      # echo "No architecture data found."
-      # exit 1
-      ARCHS=("unknown")
+      echo "No architecture data found."
+      exit 1
     fi
-
-    local platform="${ARCHS[*]}"
 
     # Get the package data from Cloudsmith API packages list endpoint
     getPackageData () {
@@ -114,31 +107,56 @@ getDigestData () {
 
       
       # handle the different status's
-      local status_display=""
-      for s in "${STATUS[@]}"; do
-         case "$s" in
-            Completed)     status_display+="${s} ${CHECK} " ;;
-            "In Progress") status_display+="${s} ${TIMER} " ;;
-            Quarantined)   status_display+="${s} ${VULN} " ;;
-            Failed)        status_display+="${s} ${CROSS} " ;;
-            *)             status_display+="${s} " ;;
-         esac
-      done
+      case "${STATUS[0]}" in
+        Completed)
+          echo "          |____ Status: ${STATUS[0]} ${CHECK}" 
+          ;;
 
-      local dl=0
+        "In Progress")
+          echo "          |____ Status: ${STATUS[0]} ${TIMER}" 
+          ;;
+
+        Quarantined)
+          echo "          |____ Status: ${STATUS[1]} ${VULN}" 
+          ;;
+
+        Failed)
+          echo "          |____ Status: ${STATUS[0]} ${FAIL}" 
+          ;;
+        
+      esac
+
+      case "${STATUS[1]}" in
+        Completed)
+          echo "          |____ Status: ${STATUS[1]} ${CHECK}" 
+          ;;
+
+        "In Progress")
+          echo "          |____ Status: ${STATUS[1]} ${TIMER}" 
+          ;;
+
+        Quarantined)
+          echo "          |____ Status: ${STATUS[1]} ${VULN}" 
+          ;;
+
+        Failed)
+          echo "          |____ Status: ${STATUS[1]} ${FAIL}" 
+          ;;
+        
+      esac
+
       if (( ${#DOWNLOADS[@]} == 3  )); then
-        dl=${DOWNLOADS[1]}
-      elif (( ${#DOWNLOADS[@]} > 0 )); then
-        dl=${DOWNLOADS[0]}
+        echo "          |____ Downloads: ${DOWNLOADS[1]}"
+        count=${DOWNLOADS[1]}
+        totalDownloads=$((totalDownloads+count))
+      else 
+        echo "          |____ Downloads: ${DOWNLOADS[0]}"
       fi 
-      
-      totalDownloads=$((totalDownloads+dl))
-
-      printf "$TBL_FMT" "${nTAG}" "${platform}" "${status_display}" "${dl}" "${digest}"
-      echo "$SEP_LINE"
 
     }
 
+    echo "        - ${digest}"
+    echo "        - Platform: ${ARCHS}"
     getPackageData "${digest}"
 
   }
@@ -151,15 +169,15 @@ getDockerDigests () {
   local totalDownloads=0
   API_BASE="https://api.cloudsmith.io/v1/packages/${WORKSPACE}/${REPO}/"
 
-  # index_digest="$(curl -fsSL "${AUTH_HEADER[@]}" \
-  #   -H "Accept: application/vnd.oci.image.manifest.v1+json" \
-  #   -o /dev/null \
-  #   -w "%header{Docker-Content-Digest}" \
-  #   "${CLOUDSMITH_URL}/v2/${WORKSPACE}/${REPO}/${IMG}/manifests/${nTAG}")"
+  index_digest="$(curl -fsSL "${AUTH_HEADER[@]}" \
+    -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+    -o /dev/null \
+    -w "%header{Docker-Content-Digest}" \
+    "${CLOUDSMITH_URL}/v2/${WORKSPACE}/${REPO}/${IMG}/manifests/${nTAG}")"
   
-  # echo
-  # echo "🐳 ${WORKSPACE}/${REPO}/${IMG}:${nTAG}"
-  # echo "   Index Digest: ${index_digest}"
+  echo
+  echo "🐳 ${WORKSPACE}/${REPO}/${IMG}:${nTAG}"
+  echo "   Index Digest: ${index_digest}"
   
 
   MANIFEST_JSON="$(curl -L -sS "${AUTH_HEADER[@]}" \
@@ -182,14 +200,16 @@ getDockerDigests () {
   ' <<< "${MANIFEST_JSON}" | awk 'NF' | sort -u)
 
   if (( ${#DIGESTS[@]} == 0 )); then
-    # echo "No digests found."
-    return
+    echo "No digests found."
+    exit 1
   fi
 
   for i in "${!DIGESTS[@]}"; do  
+    echo
     getDigestData "${DIGESTS[i]}"
+    echo
   done
-  # echo "  |___ Total Downloads: ${totalDownloads}"
+  echo "  |___ Total Downloads: ${totalDownloads}"
 
 }
 
@@ -197,21 +217,17 @@ getDockerDigests () {
 # Lookup Docker multi-arch images and output an overview
 getDockerTags
 read -r -a images <<< "$nTAGS"
-echo "Found matching tags: ${#images[@]}"
-
+echo "Found matching tags:"
+echo
 for t in "${!images[@]}"; do
   tag=" - ${images[t]}"
   echo "$tag"
 done 
 
 echo
-echo "$SEP_LINE"
-printf "$TBL_FMT" "TAG" "PLATFORM" "STATUS" "DOWNLOADS" "DIGEST"
-echo "$SEP_LINE"
-
 for t in "${!images[@]}"; do
   getDockerDigests "${images[t]}"
-done
+done 
 
 
 
