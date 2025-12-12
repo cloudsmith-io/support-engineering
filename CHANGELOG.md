@@ -6,21 +6,9 @@ This project follows [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
-### Added
-- Initial structure for Customer Engineering template repo
-- GitHub Issue Forms for bug reports and feature requests
-- CI workflow with Python setup
-
-### Changed
-- N/A
-
-### Fixed
-- N/A
-
----
-
-## [1.0.0] - 2025-07-11
+## [Cloudsmith Docker Sleuth] [v1.0] [2025-12-12]
 
 ### Added
-- 🎉 First release of the CENG template!
-- Includes CI, GitHub forms, CONTRIBUTING, CODEOWNERS, and PR template
+- Analyze your Cloudsmith Docker repositories with a hierarchical view of multi-arch tags, 
+manifest digests, platform support, sync status, and download statistics.
+- Query untagged (orphaned) multi-arch images and delete them. 
