@@ -1,4 +1,6 @@
-# Docker Multi-Arch images overview script
+# Docker Multi-Arch Inspector
+
+
 
 The script will return an overview of your Docker multi-arch images stored in your Cloudsmith repository. 
 It provides a hierarchial breakdown of each image by tag, showing the index digest and it's associated manifest digests with their platform, cloudsmith sync status and downloads count. 
