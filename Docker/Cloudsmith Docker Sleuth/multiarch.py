@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# filepath: /Users/cmoynes/dev/support-engineering/Docker/Multi-Arch-Inspector/multiarch.py
+
 import sys
 import os
 import json
