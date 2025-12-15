@@ -8,6 +8,7 @@ import urllib.request
 import urllib.error
 from urllib.parse import urlencode
 import concurrent.futures
+import time
 
 # Try to import rich
 try:
@@ -15,6 +16,7 @@ try:
     from rich.table import Table
     from rich import box
     from rich.text import Text
+    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn
 except ImportError:
     print("Error: This script requires the 'rich' library.")
     print("Please install it using: pip install rich")
@@ -32,7 +34,7 @@ AUTH_HEADER = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
 # --- Helper Functions ---
 
 def make_request(url, headers=None, method='GET', data=None):
-    """Performs an HTTP request and returns parsed JSON."""
+    """Performs an HTTP request and returns parsed JSON. Handles rate limiting."""
     if headers is None:
         headers = {}
     
@@ -42,14 +44,48 @@ def make_request(url, headers=None, method='GET', data=None):
     if data:
         req.data = data.encode('utf-8')
 
-    try:
-        with urllib.request.urlopen(req) as response:
-            return json.loads(response.read().decode('utf-8'))
-    except urllib.error.HTTPError as e:
-        return None
-    except Exception as e:
-        # Avoid printing to stderr in threads to prevent garbled output
-        return None
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            with urllib.request.urlopen(req) as response:
+                # Proactive Rate Limit Handling via Headers
+                # https://docs.cloudsmith.com/api/rate-limits#monitoring-your-usage
+                remaining = response.headers.get('X-RateLimit-Remaining')
+                if remaining is not None and int(remaining) < 3:
+                    reset = response.headers.get('X-RateLimit-Reset')
+                    if reset:
+                        wait = float(reset) - time.time()
+                        if wait > 0 and wait < 30: # Only sleep if wait is reasonable
+                            time.sleep(wait + 0.5)
+
+                if method == 'DELETE':
+                    return True
+                return json.loads(response.read().decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                # Rate limited - wait and retry
+                retry_after = e.headers.get('Retry-After')
+                if retry_after:
+                    wait_time = float(retry_after)
+                else:
+                    # Fallback to X-RateLimit-Reset
+                    reset = e.headers.get('X-RateLimit-Reset')
+                    if reset:
+                        wait_time = float(reset) - time.time()
+                    else:
+                        wait_time = (2 ** attempt)
+                
+                if wait_time < 0: wait_time = 1
+                time.sleep(wait_time + 0.5)
+                continue
+            elif e.code == 404:
+                return None
+            else:
+                return None
+        except Exception as e:
+            return None
+    
+    return None
 
 def find_key_recursive(obj, key):
     """Recursively searches for a key in a dictionary/list and returns a list of values."""
@@ -257,7 +293,7 @@ def fetch_untagged_data(pkg, workspace, repo, img, detailed=False):
     return rows, slug
 
 def get_untagged_images(workspace, repo, img, delete=False, detailed=False):
-    console.print("[bold]Searching for untagged manifest lists...[/bold]")
+    # console.print("[bold]Searching for untagged manifest lists...[/bold]") # Removed print
     api_url = f"https://api.cloudsmith.io/v1/packages/{workspace}/{repo}/"
     query = urlencode({'query': f"name:{img}"})
     full_url = f"{api_url}?{query}"
@@ -273,11 +309,97 @@ def get_untagged_images(workspace, repo, img, delete=False, detailed=False):
                     untagged_pkgs.append(p)
 
     if not untagged_pkgs:
-        console.print("[yellow]No untagged manifest lists found.[/yellow]")
-        return
+        # console.print("[yellow]No untagged manifest lists found.[/yellow]") # Removed print
+        return None
 
-    # Create Table
-    table = Table(title="Untagged Manifest Lists", box=box.ROUNDED)
+    # Fetch data first
+    results_map = {}
+    packages_to_delete = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(fetch_untagged_data, pkg, workspace, repo, img, detailed): i for i, pkg in enumerate(untagged_pkgs)}
+        for future in concurrent.futures.as_completed(futures):
+            index = futures[future]
+            try:
+                rows, slug = future.result()
+                results_map[index] = (rows, slug)
+                packages_to_delete.append(slug)
+            except Exception:
+                pass
+
+    # Perform Deletion if requested
+    deleted_slugs = set()
+    if delete and packages_to_delete:
+        batch_size = 10
+        def delete_pkg_task(slug):
+            del_url = f"https://api.cloudsmith.io/v1/packages/{workspace}/{repo}/{slug}/"
+            return slug, make_request(del_url, method='DELETE')
+
+        for i in range(0, len(packages_to_delete), batch_size):
+            batch = packages_to_delete[i:i + batch_size]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as executor:
+                futures = [executor.submit(delete_pkg_task, slug) for slug in batch]
+                for future in concurrent.futures.as_completed(futures):
+                    slug, success = future.result()
+                    if success:
+                        deleted_slugs.add(slug)
+            
+            if i + batch_size < len(packages_to_delete):
+                time.sleep(1.1)
+
+    # Build Table
+    table = Table(title=f"Untagged Manifest Lists: {img}", box=box.ROUNDED)
+    table.add_column("Tag", style="cyan")
+    table.add_column("Type", style="magenta")
+    table.add_column("Platform")
+    table.add_column("Status")
+    table.add_column("Downloads", justify="right")
+    table.add_column("Digest", style="dim")
+    if delete:
+        table.add_column("Action", style="bold red")
+
+    for i in range(len(untagged_pkgs)):
+        if i in results_map:
+            rows, slug = results_map[i]
+            
+            action_str = ""
+            if delete:
+                if slug in deleted_slugs:
+                    action_str = "Deleted"
+                else:
+                    action_str = "Failed"
+
+            for row in rows:
+                if row == "SECTION":
+                    table.add_section()
+                else:
+                    if delete:
+                        table.add_row(*row, action_str)
+                    else:
+                        table.add_row(*row)
+    
+    return table
+
+def get_image_analysis(workspace, repo, img_name, detailed=False):
+    tags_url = f"{CLOUDSMITH_URL}/v2/{workspace}/{repo}/{img_name}/tags/list"
+    tags_json = make_request(tags_url, {"Accept": "application/vnd.oci.image.manifest.v1+json", "Cache-Control": "no-cache"})
+    
+    tags = []
+    if tags_json:
+        raw_tags = find_key_recursive(tags_json, 'tags')
+        flat_tags = []
+        for item in raw_tags:
+            if isinstance(item, list):
+                flat_tags.extend(item)
+            else:
+                flat_tags.append(item)
+        
+        tags = sorted(list(set(flat_tags)))
+
+    if not tags:
+        return None
+
+    table = Table(title=f"Image Analysis: {img_name}", box=box.ROUNDED)
     table.add_column("Tag", style="cyan")
     table.add_column("Type", style="magenta")
     table.add_column("Platform")
@@ -285,45 +407,32 @@ def get_untagged_images(workspace, repo, img, delete=False, detailed=False):
     table.add_column("Downloads", justify="right")
     table.add_column("Digest", style="dim")
 
-    packages_to_delete = []
-
-    with console.status("[bold green]Fetching untagged data...[/bold green]"):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            # Submit all tasks
-            futures = {executor.submit(fetch_untagged_data, pkg, workspace, repo, img, detailed): i for i, pkg in enumerate(untagged_pkgs)}
-            
-            results = {}
-            for future in concurrent.futures.as_completed(futures):
-                index = futures[future]
-                try:
-                    results[index] = future.result()
-                except Exception as e:
-                    console.print(f"[red]Error processing untagged image: {e}[/red]")
-
-            # Add to table in original order
-            for i in range(len(untagged_pkgs)):
-                if i in results:
-                    rows, slug = results[i]
-                    packages_to_delete.append(slug)
-                    for row in rows:
-                        if row == "SECTION":
-                            table.add_section()
-                        else:
-                            table.add_row(*row)
-
-    console.print(table)
-
-    if delete:
-        console.print("\n[bold red]Deleting untagged packages...[/bold red]")
-        for slug in packages_to_delete:
-            console.print(f"   Deleting package: {slug}...", end=" ")
-            del_url = f"https://api.cloudsmith.io/v1/packages/{workspace}/{repo}/{slug}/"
-            req = urllib.request.Request(del_url, headers=AUTH_HEADER, method='DELETE')
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_tag = {executor.submit(fetch_tag_data, workspace, repo, img_name, t, detailed): t for t in tags}
+        
+        results = {}
+        for future in concurrent.futures.as_completed(future_to_tag):
+            tag = future_to_tag[future]
             try:
-                with urllib.request.urlopen(req):
-                    console.print("[green]Deleted.[/green]")
-            except Exception as e:
-                console.print(f"[red]Failed: {e}[/red]")
+                results[tag] = future.result()
+            except Exception:
+                pass
+        
+        for t in tags:
+            if t in results:
+                rows = results[t]
+                for row in rows:
+                    if row == "SECTION":
+                        table.add_section()
+                    else:
+                        table.add_row(*row)
+    return table
+
+def process_image(org, repo, img_name, args):
+    if args.untagged or args.untagged_delete:
+        return get_untagged_images(org, repo, img_name, delete=args.untagged_delete, detailed=args.detailed)
+    else:
+        return get_image_analysis(org, repo, img_name, detailed=args.detailed)
 
 def main():
     parser = argparse.ArgumentParser(description="Docker Multi-Arch Inspector")
@@ -351,68 +460,38 @@ def main():
             console.print("[red]Failed to fetch catalog or no images found.[/red]")
             sys.exit(1)
 
-    for img_name in images_to_scan:
-        console.print(f"\nDocker Image: [bold blue]{args.org}/{args.repo}/{img_name}[/bold blue]")
-
-        if args.untagged or args.untagged_delete:
-            get_untagged_images(args.org, args.repo, img_name, delete=args.untagged_delete, detailed=args.detailed)
-        else:
-            # Get Tags
-            tags_url = f"{CLOUDSMITH_URL}/v2/{args.org}/{args.repo}/{img_name}/tags/list"
-            tags_json = make_request(tags_url, {"Accept": "application/vnd.oci.image.manifest.v1+json", "Cache-Control": "no-cache"})
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        console=console
+    ) as progress:
+        task = progress.add_task(f"Scanning {len(images_to_scan)} images...", total=len(images_to_scan))
+        
+        # Use a reasonable number of workers for images (e.g., 5)
+        # Each image might spawn its own threads for tags/digests
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_img = {
+                executor.submit(process_image, args.org, args.repo, img, args): img 
+                for img in images_to_scan
+            }
             
-            tags = []
-            if tags_json:
-                raw_tags = find_key_recursive(tags_json, 'tags')
-                flat_tags = []
-                for item in raw_tags:
-                    if isinstance(item, list):
-                        flat_tags.extend(item)
+            for future in concurrent.futures.as_completed(future_to_img):
+                img_name = future_to_img[future]
+                try:
+                    table = future.result()
+                    if table:
+                        # Print the table to the console (thread-safe via rich)
+                        progress.console.print(table)
+                        progress.console.print("") # Newline
                     else:
-                        flat_tags.append(item)
+                        # Optional: log empty/no tags
+                        pass
+                except Exception as e:
+                    progress.console.print(f"[red]Error processing {img_name}: {e}[/red]")
                 
-                tags = sorted(list(set(flat_tags)))
-
-            if not tags:
-                console.print(f"[yellow]No tags found for {img_name}.[/yellow]")
-                continue
-
-            console.print(f"Found matching tags: [bold]{len(tags)}[/bold]")
-            
-            # Create Main Table
-            table = Table(title=f"Image Analysis: {img_name}", box=box.ROUNDED)
-            table.add_column("Tag", style="cyan")
-            table.add_column("Type", style="magenta")
-            table.add_column("Platform")
-            table.add_column("Status")
-            table.add_column("Downloads", justify="right")
-            table.add_column("Digest", style="dim")
-
-            with console.status(f"[bold green]Fetching data for {img_name}...[/bold green]"):
-                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                    # Submit all tasks
-                    future_to_tag = {executor.submit(fetch_tag_data, args.org, args.repo, img_name, t, args.detailed): t for t in tags}
-                    
-                    results = {}
-                    for future in concurrent.futures.as_completed(future_to_tag):
-                        tag = future_to_tag[future]
-                        try:
-                            results[tag] = future.result()
-                        except Exception as exc:
-                            console.print(f"[red]Tag {tag} generated an exception: {exc}[/red]")
-                    
-                    # Add to table in sorted order
-                    for t in tags:
-                        if t in results:
-                            rows = results[t]
-                            for row in rows:
-                                if row == "SECTION":
-                                    table.add_section()
-                                else:
-                                    table.add_row(*row)
-
-            # Print the final table
-            console.print(table)
+                progress.advance(task)
 
 if __name__ == "__main__":
     main()
