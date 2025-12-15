@@ -228,7 +228,7 @@ def fetch_tag_data(workspace, repo, img, ntag, detailed=False):
         "[magenta]manifest/list[/magenta]",
         "multi",
         status_display,
-        str(total_downloads),
+        f"[green]{total_downloads}[/green]",
         f"[dim]{index_digest}[/dim]"
     ])
 
@@ -280,7 +280,7 @@ def fetch_untagged_data(pkg, workspace, repo, img, detailed=False):
         "manifest/list", 
         platform_str, 
         status_display, 
-        str(downloads), 
+        f"[green]{downloads}[/green]", 
         digest
     ])
 
@@ -435,6 +435,22 @@ def process_image(org, repo, img_name, args):
         return get_image_analysis(org, repo, img_name, detailed=args.detailed)
 
 def main():
+    console.print(r"""[bold cyan]
+██████╗██╗      ██████╗ ██╗   ██╗██████╗ ███████╗███╗   ███╗██╗████████╗██╗  ██╗
+██╔════╝██║     ██╔═══██╗██║   ██║██╔══██╗██╔════╝████╗ ████║██║╚══██╔══╝██║  ██║
+██║     ██║     ██║   ██║██║   ██║██║  ██║███████╗██╔████╔██║██║   ██║   ███████║
+██║     ██║     ██║   ██║██║   ██║██║  ██║╚════██║██║╚██╔╝██║██║   ██║   ██╔══██║
+╚██████╗███████╗╚██████╔╝╚██████╔╝██████╔╝███████║██║ ╚═╝ ██║██║   ██║   ██║  ██║
+ ╚═════╝╚══════╝ ╚═════╝  ╚═════╝ ╚═════╝ ╚══════╝╚═╝     ╚═╝╚═╝   ╚═╝   ╚═╝  ╚═╝
+
+██████╗  ██████╗  ██████╗██╗  ██╗███████╗██████╗     ███████╗██╗     ███████╗██╗   ██╗████████╗██╗  ██╗
+██╔══██╗██╔═══██╗██╔════╝██║ ██╔╝██╔════╝██╔══██╗    ██╔════╝██║     ██╔════╝██║   ██║╚══██╔══╝██║  ██║
+██║  ██║██║   ██║██║     █████╔╝ █████╗  ██████╔╝    ███████╗██║     █████╗  ██║   ██║   ██║   ███████║
+██║  ██║██║   ██║██║     ██╔═██╗ ██╔══╝  ██╔══██╗    ╚════██║██║     ██╔══╝  ██║   ██║   ██║   ██╔══██║
+██████╔╝╚██████╔╝╚██████╗██║  ██╗███████╗██║  ██║    ███████║███████╗███████╗╚██████╔╝   ██║   ██║  ██║
+╚═════╝  ╚═════╝  ╚═════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝    ╚══════╝╚══════╝╚══════╝ ╚═════╝    ╚═╝   ╚═╝  ╚═╝
+[/bold cyan]""")
+
     parser = argparse.ArgumentParser(description="Docker Multi-Arch Inspector")
     parser.add_argument("org", help="Cloudsmith Organization/User")
     parser.add_argument("repo", help="Cloudsmith Repository")
@@ -467,11 +483,15 @@ def main():
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         console=console
     ) as progress:
-        task = progress.add_task(f"Scanning {len(images_to_scan)} images...", total=len(images_to_scan))
+        task = progress.add_task(f"Processing {len(images_to_scan)} images...", total=len(images_to_scan))
         
+        collected_results = []
+
         # Use a reasonable number of workers for images (e.g., 5)
         # Each image might spawn its own threads for tags/digests
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        # Manually manage executor to handle KeyboardInterrupt gracefully
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+        try:
             future_to_img = {
                 executor.submit(process_image, args.org, args.repo, img, args): img 
                 for img in images_to_scan
@@ -482,9 +502,7 @@ def main():
                 try:
                     table = future.result()
                     if table:
-                        # Print the table to the console (thread-safe via rich)
-                        progress.console.print(table)
-                        progress.console.print("") # Newline
+                        collected_results.append((img_name, table))
                     else:
                         # Optional: log empty/no tags
                         pass
@@ -492,6 +510,28 @@ def main():
                     progress.console.print(f"[red]Error processing {img_name}: {e}[/red]")
                 
                 progress.advance(task)
+            
+            # Normal shutdown
+            executor.shutdown(wait=True)
+            
+        except KeyboardInterrupt:
+            # Force shutdown without waiting
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+
+    # Sort results by image name and print
+    collected_results.sort(key=lambda x: x[0])
+    
+    if not collected_results:
+        console.print("[yellow]No matching images or tags found.[/yellow]")
+
+    for _, table in collected_results:
+        console.print(table)
+        console.print("")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        console.print("\n[bold red]Operation cancelled by user.[/bold red]")
+        # Use os._exit to avoid
