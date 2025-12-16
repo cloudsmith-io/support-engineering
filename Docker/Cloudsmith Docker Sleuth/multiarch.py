@@ -3,6 +3,7 @@
 import sys
 import os
 import json
+import csv
 import argparse
 import urllib.request
 import urllib.error
@@ -112,7 +113,7 @@ def format_status(status_str):
 # --- Core Logic ---
 
 def get_digest_data(workspace, repo, img, digest, ntag_display, platform="unknown"):
-    """Fetches data for a specific digest (child image) and returns row data."""
+    """Fetches data for a specific digest (child image) and returns data dict."""
     
     # 1. Fetch Manifest to get Architecture (Only if unknown)
     if platform == "unknown":
@@ -140,13 +141,13 @@ def get_digest_data(workspace, repo, img, digest, ntag_display, platform="unknow
     api_url = f"https://api.cloudsmith.io/v1/packages/{workspace}/{repo}/?query=version:{version}"
     pkg_details = make_request(api_url, {"Cache-Control": "no-cache"})
     
-    status_display = ""
+    status_raw = "Unknown"
     dl = 0
     
     if pkg_details:
         statuses = set(find_key_recursive(pkg_details, 'status_str'))
-        status_parts = [format_status(s) for s in statuses]
-        status_display = " ".join(status_parts)
+        if statuses:
+            status_raw = " ".join(sorted(list(statuses)))
 
         downloads = find_key_recursive(pkg_details, 'downloads')
         if len(downloads) >= 2:
@@ -154,19 +155,18 @@ def get_digest_data(workspace, repo, img, digest, ntag_display, platform="unknow
         elif len(downloads) > 0:
             dl = downloads[0]
 
-    # Return tuple of (Row Columns List, Download Count)
-    row_data = [
-        f"  └─ {ntag_display}", 
-        "image", 
-        platform, 
-        status_display, 
-        str(dl), 
-        f"[dim]{digest}[/dim]"
-    ]
-    return row_data, dl
+    return {
+        "tag": ntag_display,
+        "type": "image",
+        "platform": platform,
+        "status": status_raw,
+        "downloads": dl,
+        "digest": digest,
+        "is_child": True
+    }
 
 def fetch_tag_data(workspace, repo, img, ntag, detailed=False):
-    """Fetches the manifest list for a tag and returns rows for the table."""
+    """Fetches the manifest list for a tag and returns a list of data dicts."""
     
     manifest_url = f"{CLOUDSMITH_URL}/v2/{workspace}/{repo}/{img}/manifests/{ntag}"
     manifest_json = make_request(manifest_url, {"Accept": "application/vnd.oci.image.manifest.v1+json", "Cache-Control": "no-cache"})
@@ -196,13 +196,13 @@ def fetch_tag_data(workspace, repo, img, ntag, detailed=False):
         return []
 
     # Process children
-    children_rows = []
+    children_data = []
     total_downloads = 0
     
     for child in children:
-        row, dl = get_digest_data(workspace, repo, img, child['digest'], ntag, platform=child['platform'])
-        children_rows.append(row)
-        total_downloads += dl
+        data = get_digest_data(workspace, repo, img, child['digest'], ntag, platform=child['platform'])
+        children_data.append(data)
+        total_downloads += data['downloads']
 
     # Fetch parent package info
     api_url = f"https://api.cloudsmith.io/v1/packages/{workspace}/{repo}/?query=version:{ntag}"
@@ -219,25 +219,23 @@ def fetch_tag_data(workspace, repo, img, ntag, detailed=False):
         else:
             index_digest = ver
 
-    status_display = format_status(parent_status)
+    results = []
+    # Parent Data
+    results.append({
+        "tag": ntag,
+        "type": "manifest/list",
+        "platform": "multi",
+        "status": parent_status,
+        "downloads": total_downloads,
+        "digest": index_digest,
+        "is_child": False
+    })
 
-    rows = []
-    # Parent Row
-    rows.append([
-        f"[bold cyan]{ntag}[/bold cyan]",
-        "[magenta]manifest/list[/magenta]",
-        "multi",
-        status_display,
-        f"[green]{total_downloads}[/green]",
-        f"[dim]{index_digest}[/dim]"
-    ])
-
-    # Children Rows
+    # Children Data
     if detailed:
-        rows.extend(children_rows)
-        rows.append("SECTION")
+        results.extend(children_data)
 
-    return rows
+    return results
 
 def fetch_untagged_data(pkg, workspace, repo, img, detailed=False):
     digest = pkg.get('version')
@@ -272,28 +270,26 @@ def fetch_untagged_data(pkg, workspace, repo, img, detailed=False):
         
         platform_str = " ".join(sorted(list(archs)))
 
-    status_display = format_status(status)
-
-    rows = []
-    rows.append([
-        "(untagged)", 
-        "manifest/list", 
-        platform_str, 
-        status_display, 
-        f"[green]{downloads}[/green]", 
-        digest
-    ])
+    results = []
+    results.append({
+        "tag": "(untagged)",
+        "type": "manifest/list",
+        "platform": platform_str,
+        "status": status,
+        "downloads": downloads,
+        "digest": digest,
+        "is_child": False,
+        "slug": slug # Internal use
+    })
 
     if detailed:
         for child in child_digests:
-            row, _ = get_digest_data(workspace, repo, img, child['digest'], "(untagged)", platform=child['platform'])
-            rows.append(row)
-        rows.append("SECTION")
+            data = get_digest_data(workspace, repo, img, child['digest'], "(untagged)", platform=child['platform'])
+            results.append(data)
         
-    return rows, slug
+    return results, slug
 
 def get_untagged_images(workspace, repo, img, delete=False, detailed=False):
-    # console.print("[bold]Searching for untagged manifest lists...[/bold]") # Removed print
     api_url = f"https://api.cloudsmith.io/v1/packages/{workspace}/{repo}/"
     query = urlencode({'query': f"name:{img}"})
     full_url = f"{api_url}?{query}"
@@ -309,7 +305,6 @@ def get_untagged_images(workspace, repo, img, delete=False, detailed=False):
                     untagged_pkgs.append(p)
 
     if not untagged_pkgs:
-        # console.print("[yellow]No untagged manifest lists found.[/yellow]") # Removed print
         return None
 
     # Fetch data first
@@ -329,6 +324,7 @@ def get_untagged_images(workspace, repo, img, delete=False, detailed=False):
 
     # Perform Deletion if requested
     deleted_slugs = set()
+    failed_slugs = set()
     if delete and packages_to_delete:
         batch_size = 10
         def delete_pkg_task(slug):
@@ -343,42 +339,34 @@ def get_untagged_images(workspace, repo, img, delete=False, detailed=False):
                     slug, success = future.result()
                     if success:
                         deleted_slugs.add(slug)
+                    else:
+                        failed_slugs.add(slug)
             
             if i + batch_size < len(packages_to_delete):
                 time.sleep(1.1)
 
-    # Build Table
-    table = Table(title=f"Untagged Manifest Lists: {img}", box=box.ROUNDED)
-    table.add_column("Tag", style="cyan")
-    table.add_column("Type", style="magenta")
-    table.add_column("Platform")
-    table.add_column("Status")
-    table.add_column("Downloads", justify="right")
-    table.add_column("Digest", style="dim")
-    if delete:
-        table.add_column("Action", style="bold red")
-
+    # Build Result Groups
+    groups = []
     for i in range(len(untagged_pkgs)):
         if i in results_map:
             rows, slug = results_map[i]
             
+            # Update action status
             action_str = ""
             if delete:
                 if slug in deleted_slugs:
                     action_str = "Deleted"
-                else:
+                elif slug in failed_slugs:
                     action_str = "Failed"
-
+            
             for row in rows:
-                if row == "SECTION":
-                    table.add_section()
-                else:
-                    if delete:
-                        table.add_row(*row, action_str)
-                    else:
-                        table.add_row(*row)
+                row['action'] = action_str
+                # Remove internal slug
+                if 'slug' in row: del row['slug']
+            
+            groups.append(rows)
     
-    return table
+    return groups
 
 def get_image_analysis(workspace, repo, img_name, detailed=False):
     tags_url = f"{CLOUDSMITH_URL}/v2/{workspace}/{repo}/{img_name}/tags/list"
@@ -399,14 +387,7 @@ def get_image_analysis(workspace, repo, img_name, detailed=False):
     if not tags:
         return None
 
-    table = Table(title=f"Image Analysis: {img_name}", box=box.ROUNDED)
-    table.add_column("Tag", style="cyan")
-    table.add_column("Type", style="magenta")
-    table.add_column("Platform")
-    table.add_column("Status")
-    table.add_column("Downloads", justify="right")
-    table.add_column("Digest", style="dim")
-
+    groups = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         future_to_tag = {executor.submit(fetch_tag_data, workspace, repo, img_name, t, detailed): t for t in tags}
         
@@ -420,19 +401,59 @@ def get_image_analysis(workspace, repo, img_name, detailed=False):
         
         for t in tags:
             if t in results:
-                rows = results[t]
-                for row in rows:
-                    if row == "SECTION":
-                        table.add_section()
-                    else:
-                        table.add_row(*row)
-    return table
+                groups.append(results[t])
+    return groups
 
 def process_image(org, repo, img_name, args):
     if args.untagged or args.untagged_delete:
         return get_untagged_images(org, repo, img_name, delete=args.untagged_delete, detailed=args.detailed)
     else:
         return get_image_analysis(org, repo, img_name, detailed=args.detailed)
+
+def render_table(image_name, groups, is_untagged=False, has_action=False):
+    title = f"Untagged Manifest Lists: {image_name}" if is_untagged else f"Image Analysis: {image_name}"
+    table = Table(title=title, box=box.ROUNDED)
+    table.add_column("Tag", style="cyan")
+    table.add_column("Type", style="magenta")
+    table.add_column("Platform")
+    table.add_column("Status")
+    table.add_column("Downloads", justify="right")
+    table.add_column("Digest", style="dim")
+    if has_action:
+        table.add_column("Action", style="bold red")
+
+    for i, group in enumerate(groups):
+        if i > 0:
+            table.add_section()
+        
+        for row in group:
+            # Format for Table
+            tag_display = row['tag']
+            if row['is_child']:
+                tag_display = f"  └─ {row['tag']}"
+            else:
+                tag_display = f"[bold cyan]{row['tag']}[/bold cyan]"
+            
+            type_display = row['type']
+            if type_display == 'manifest/list':
+                type_display = "[magenta]manifest/list[/magenta]"
+            
+            status_display = format_status(row['status'])
+            
+            dl_display = str(row['downloads'])
+            if row['type'] == 'manifest/list':
+                dl_display = f"[green]{dl_display}[/green]"
+            
+            digest_display = f"[dim]{row['digest']}[/dim]"
+            
+            row_data = [tag_display, type_display, row['platform'], status_display, dl_display, digest_display]
+            
+            if has_action:
+                row_data.append(row.get('action', ''))
+            
+            table.add_row(*row_data)
+            
+    return table
 
 def main():
     console.print(r"""[bold cyan]
@@ -458,6 +479,7 @@ def main():
     parser.add_argument("--untagged", action="store_true", help="Find untagged manifest lists")
     parser.add_argument("--untagged-delete", action="store_true", help="Delete untagged manifest lists")
     parser.add_argument("--detailed", action="store_true", help="Show detailed breakdown of digests")
+    parser.add_argument("--output", choices=['table', 'json', 'csv'], default='table', help="Output format (default: table)")
 
     args = parser.parse_args()
 
@@ -466,30 +488,45 @@ def main():
     if args.img:
         images_to_scan.append(args.img)
     else:
-        console.print(f"[bold]Fetching catalog for {args.org}/{args.repo}...[/bold]")
+        if args.output == 'table':
+            console.print(f"[bold]Fetching catalog for {args.org}/{args.repo}...[/bold]")
         catalog_url = f"{CLOUDSMITH_URL}/v2/{args.org}/{args.repo}/_catalog"
         catalog_json = make_request(catalog_url, {"Accept": "application/json", "Cache-Control": "no-cache"})
         
         if catalog_json and 'repositories' in catalog_json:
             images_to_scan = catalog_json['repositories']
         else:
-            console.print("[red]Failed to fetch catalog or no images found.[/red]")
+            if args.output == 'table':
+                console.print("[red]Failed to fetch catalog or no images found.[/red]")
             sys.exit(1)
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        console=console
-    ) as progress:
-        task = progress.add_task(f"Processing {len(images_to_scan)} images...", total=len(images_to_scan))
-        
-        collected_results = []
+    # Only show progress bar for table output
+    if args.output == 'table':
+        progress_ctx = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            console=console
+        )
+    else:
+        # Dummy context manager for non-table output
+        class DummyProgress:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def add_task(self, *args, **kwargs): return None
+            def advance(self, *args, **kwargs): pass
+            @property
+            def console(self): return console # fallback
+        progress_ctx = DummyProgress()
 
+    collected_results = []
+
+    with progress_ctx as progress:
+        if args.output == 'table':
+            task = progress.add_task(f"Processing {len(images_to_scan)} images...", total=len(images_to_scan))
+        
         # Use a reasonable number of workers for images (e.g., 5)
-        # Each image might spawn its own threads for tags/digests
-        # Manually manage executor to handle KeyboardInterrupt gracefully
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
         try:
             future_to_img = {
@@ -500,38 +537,79 @@ def main():
             for future in concurrent.futures.as_completed(future_to_img):
                 img_name = future_to_img[future]
                 try:
-                    table = future.result()
-                    if table:
-                        collected_results.append((img_name, table))
-                    else:
-                        # Optional: log empty/no tags
-                        pass
+                    groups = future.result()
+                    if groups:
+                        collected_results.append((img_name, groups))
                 except Exception as e:
-                    progress.console.print(f"[red]Error processing {img_name}: {e}[/red]")
+                    if args.output == 'table':
+                        progress.console.print(f"[red]Error processing {img_name}: {e}[/red]")
                 
-                progress.advance(task)
+                if args.output == 'table':
+                    progress.advance(task)
             
-            # Normal shutdown
             executor.shutdown(wait=True)
             
         except KeyboardInterrupt:
-            # Force shutdown without waiting
             executor.shutdown(wait=False, cancel_futures=True)
             raise
 
-    # Sort results by image name and print
+    # Sort results by image name
     collected_results.sort(key=lambda x: x[0])
     
     if not collected_results:
-        console.print("[yellow]No matching images or tags found.[/yellow]")
+        if args.output == 'table':
+            console.print("[yellow]No matching images or tags found.[/yellow]")
+        elif args.output == 'json':
+            print("[]")
+        return
 
-    for _, table in collected_results:
-        console.print(table)
-        console.print("")
+    # --- Output Handling ---
+
+    if args.output == 'table':
+        for img_name, groups in collected_results:
+            is_untagged = args.untagged or args.untagged_delete
+            has_action = args.untagged_delete
+            table = render_table(img_name, groups, is_untagged, has_action)
+            console.print(table)
+            console.print("")
+
+    elif args.output == 'json':
+        # Flatten structure for JSON: List of objects, each with 'image' field
+        json_output = []
+        for img_name, groups in collected_results:
+            for group in groups:
+                for row in group:
+                    row_copy = row.copy()
+                    row_copy['image'] = img_name
+                    json_output.append(row_copy)
+        print(json.dumps(json_output, indent=2))
+
+    elif args.output == 'csv':
+        # Flatten structure for CSV
+        csv_rows = []
+        fieldnames = ['image', 'tag', 'type', 'platform', 'status', 'downloads', 'digest', 'is_child', 'action']
+        
+        for img_name, groups in collected_results:
+            for group in groups:
+                for row in group:
+                    row_copy = row.copy()
+                    row_copy['image'] = img_name
+                    # Ensure all fields exist
+                    for f in fieldnames:
+                        if f not in row_copy:
+                            row_copy[f] = ''
+                    csv_rows.append(row_copy)
+        
+        writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(csv_rows)
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        console.print("\n[bold red]Operation cancelled by user.[/bold red]")
-        # Use os._exit to avoid
+        if 'console' in globals():
+            console.print("\n[bold red]Operation cancelled by user.[/bold red]")
+        else:
+            print("\nOperation cancelled by user.")
+        sys.exit(1)
