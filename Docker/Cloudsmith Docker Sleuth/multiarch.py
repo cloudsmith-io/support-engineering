@@ -3,12 +3,15 @@
 import sys
 import os
 import json
+import csv
 import argparse
 import urllib.request
 import urllib.error
 from urllib.parse import urlencode
 import concurrent.futures
 import time
+import logging
+from datetime import datetime
 
 # Try to import rich
 try:
@@ -30,6 +33,28 @@ console = Console()
 CLOUDSMITH_URL = os.environ.get("CLOUDSMITH_URL", "https://docker.cloudsmith.io")
 API_KEY = os.environ.get("CLOUDSMITH_API_KEY")
 AUTH_HEADER = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
+
+# --- Logging Setup ---
+def setup_logging(debug_mode=False):
+    log_filename = "multiarch_inspector.log"
+    level = logging.DEBUG if debug_mode else logging.INFO
+    
+    # Reset handlers to avoid duplicate logs if called multiple times
+    root = logging.getLogger()
+    if root.handlers:
+        for handler in root.handlers:
+            root.removeHandler(handler)
+            
+    logging.basicConfig(
+        filename=log_filename,
+        level=level,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    return logging.getLogger()
+
+# Initialize with default INFO level, will be re-initialized in main
+logger = setup_logging()
 
 # --- Helper Functions ---
 
@@ -56,9 +81,11 @@ def make_request(url, headers=None, method='GET', data=None):
                     if reset:
                         wait = float(reset) - time.time()
                         if wait > 0 and wait < 30: # Only sleep if wait is reasonable
+                            logger.warning(f"Rate limit approaching. Sleeping for {wait:.2f}s")
                             time.sleep(wait + 0.5)
 
                 if method == 'DELETE':
+                    logger.info(f"DELETE Success: {url}")
                     return True
                 return json.loads(response.read().decode('utf-8'))
         except urllib.error.HTTPError as e:
@@ -76,15 +103,20 @@ def make_request(url, headers=None, method='GET', data=None):
                         wait_time = (2 ** attempt)
                 
                 if wait_time < 0: wait_time = 1
+                logger.warning(f"Rate Limited (429). Retrying in {wait_time:.2f}s. URL: {url}")
                 time.sleep(wait_time + 0.5)
                 continue
             elif e.code == 404:
+                logger.debug(f"404 Not Found: {url}")
                 return None
             else:
+                logger.error(f"HTTP Error {e.code}: {url}")
                 return None
         except Exception as e:
+            logger.error(f"Request Error: {e} - URL: {url}")
             return None
     
+    logger.error(f"Max retries exceeded for: {url}")
     return None
 
 def find_key_recursive(obj, key):
@@ -116,6 +148,7 @@ def batch_delete_packages(workspace, repo, slugs):
     if not slugs:
         return deleted, failed
         
+    logger.info(f"Starting batch deletion for {len(slugs)} packages.")
     batch_size = 10
     def delete_pkg_task(slug):
         del_url = f"https://api.cloudsmith.io/v1/packages/{workspace}/{repo}/{slug}/"
@@ -129,8 +162,10 @@ def batch_delete_packages(workspace, repo, slugs):
                 slug, success = future.result()
                 if success:
                     deleted.add(slug)
+                    logger.info(f"Deleted package slug: {slug}")
                 else:
                     failed.add(slug)
+                    logger.error(f"Failed to delete package slug: {slug}")
         
         if i + batch_size < len(slugs):
             time.sleep(1.1)
@@ -145,7 +180,7 @@ def get_digest_data(workspace, repo, img, digest, ntag_display, platform="unknow
     # 1. Fetch Manifest to get Architecture (Only if unknown)
     if platform == "unknown":
         manifest_url = f"{CLOUDSMITH_URL}/v2/{workspace}/{repo}/{img}/manifests/{digest}"
-        manifest_json = make_request(manifest_url, {"Accept": "application/vnd.oci.image.manifest.v1+json", "Cache-Control": "no-cache"})
+        manifest_json = make_request(manifest_url, {"Accept": "application/vnd.oci.image.manifest.v2+json", "Cache-Control": "no-cache"})
         
         if manifest_json:
             if 'manifests' in manifest_json:
@@ -314,14 +349,14 @@ def fetch_untagged_data(pkg, workspace, repo, img, detailed=False):
 
     if detailed:
         for child in child_digests:
-            row, _ = get_digest_data(workspace, repo, img, child['digest'], "(untagged)", platform=child['platform'])
+            # FIX: get_digest_data returns a dict, not a tuple
+            row = get_digest_data(workspace, repo, img, child['digest'], "(untagged)", platform=child['platform'])
             results.append(row)
         results.append("SECTION")
         
     return results, slug
 
 def get_untagged_images(workspace, repo, img, delete=False, detailed=False):
-    # console.print("[bold]Searching for untagged manifest lists...[/bold]") # Removed print
     api_url = f"https://api.cloudsmith.io/v1/packages/{workspace}/{repo}/"
     query = urlencode({'query': f"name:{img}"})
     full_url = f"{api_url}?{query}"
@@ -337,8 +372,9 @@ def get_untagged_images(workspace, repo, img, delete=False, detailed=False):
                     untagged_pkgs.append(p)
 
     if not untagged_pkgs:
-        # console.print("[yellow]No untagged manifest lists found.[/yellow]") # Removed print
         return None
+    
+    logger.info(f"Found {len(untagged_pkgs)} untagged manifest lists for image: {img}")
 
     # Fetch data first
     results_map = {}
@@ -376,9 +412,10 @@ def get_untagged_images(workspace, repo, img, delete=False, detailed=False):
                     action_str = "Failed"
             
             for row in rows:
-                row['action'] = action_str
-                # Remove internal slug
-                if 'slug' in row: del row['slug']
+                if isinstance(row, dict):
+                    row['action'] = action_str
+                    # Remove internal slug
+                    if 'slug' in row: del row['slug']
             
             groups.append(rows)
     
@@ -401,6 +438,7 @@ def get_image_analysis(workspace, repo, img_name, delete_all=False, delete_tag=N
         tags = sorted(list(set(flat_tags)))
 
     if not tags:
+        logger.info(f"No tags found for image: {img_name}")
         return None
 
     groups = []
@@ -435,6 +473,9 @@ def get_image_analysis(workspace, repo, img_name, delete_all=False, delete_tag=N
             if should_delete and parent.get('slug'):
                 packages_to_delete.append(parent['slug'])
 
+    if packages_to_delete:
+        logger.info(f"Identified {len(packages_to_delete)} tagged packages to delete for image: {img_name}")
+
     deleted_slugs = set()
     failed_slugs = set()
     if packages_to_delete:
@@ -456,7 +497,8 @@ def get_image_analysis(workspace, repo, img_name, delete_all=False, delete_tag=N
             parent['action'] = action_str
             # Optionally propagate to children if needed, but usually just parent row
             for row in group:
-                row['action'] = action_str
+                if isinstance(row, dict):
+                    row['action'] = action_str
 
     return groups
 
@@ -533,6 +575,26 @@ def render_table(image_name, groups, is_untagged=False, has_action=False):
     return table
 
 def main():
+    # Parse args first to configure logging
+    parser = argparse.ArgumentParser(description="Docker Multi-Arch Inspector")
+    parser.add_argument("org", help="Cloudsmith Organization/User")
+    parser.add_argument("repo", help="Cloudsmith Repository")
+    parser.add_argument("img", nargs="?", help="Image Name (Optional - if omitted, scans all images)")
+    parser.add_argument("--untagged", action="store_true", help="Find untagged manifest lists")
+    parser.add_argument("--untagged-delete", action="store_true", help="Delete untagged manifest lists")
+    parser.add_argument("--delete-all", action="store_true", help="Delete ALL detected manifest lists")
+    parser.add_argument("--delete-tag", help="Delete manifest lists matching this specific tag")
+    parser.add_argument("--detailed", action="store_true", help="Show detailed breakdown of digests")
+    parser.add_argument("--output", choices=['table', 'json', 'csv'], default='table', help="Output format (default: table)")
+    parser.add_argument("--debug-log", action="store_true", help="Enable debug logging to file")
+
+    args = parser.parse_args()
+
+    # Re-configure logging based on args
+    global logger
+    logger = setup_logging(args.debug_log)
+
+    logger.info("--- Script Started ---")
     console.print(r"""[bold cyan]
 ██████╗██╗      ██████╗ ██╗   ██╗██████╗ ███████╗███╗   ███╗██╗████████╗██╗  ██╗
 ██╔════╝██║     ██╔═══██╗██║   ██║██╔══██╗██╔════╝████╗ ████║██║╚══██╔══╝██║  ██║
@@ -559,24 +621,34 @@ def main():
     parser.add_argument("--delete-tag", help="Delete manifest lists matching this specific tag")
     parser.add_argument("--detailed", action="store_true", help="Show detailed breakdown of digests")
     parser.add_argument("--output", choices=['table', 'json', 'csv'], default='table', help="Output format (default: table)")
+    parser.add_argument("--debug-log", action="store_true", help="Enable debug logging to file")
 
     args = parser.parse_args()
+    logger.info(f"Arguments: {args}")
 
     images_to_scan = []
 
     if args.img:
         images_to_scan.append(args.img)
     else:
-        console.print(f"[bold]Fetching catalog for {args.org}/{args.repo}...[/bold]")
+        if args.output == 'table':
+            console.print(f"[bold]Fetching catalog for {args.org}/{args.repo}...[/bold]")
+        
+        logger.info(f"Fetching catalog for {args.org}/{args.repo}")
         catalog_url = f"{CLOUDSMITH_URL}/v2/{args.org}/{args.repo}/_catalog"
         catalog_json = make_request(catalog_url, {"Accept": "application/json", "Cache-Control": "no-cache"})
         
         if catalog_json and 'repositories' in catalog_json:
             images_to_scan = catalog_json['repositories']
+            logger.info(f"Found {len(images_to_scan)} images in catalog.")
         else:
-            console.print("[red]Failed to fetch catalog or no images found.[/red]")
+            msg = "Failed to fetch catalog or no images found."
+            if args.output == 'table':
+                console.print(f"[red]{msg}[/red]")
+            logger.error(msg)
             sys.exit(1)
 
+    # Only show progress bar for table output
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -601,16 +673,16 @@ def main():
             for future in concurrent.futures.as_completed(future_to_img):
                 img_name = future_to_img[future]
                 try:
-                    table = future.result()
-                    if table:
-                        collected_results.append((img_name, table))
-                    else:
-                        # Optional: log empty/no tags
-                        pass
+                    groups = future.result()
+                    if groups:
+                        collected_results.append((img_name, groups))
                 except Exception as e:
-                    progress.console.print(f"[red]Error processing {img_name}: {e}[/red]")
+                    logger.error(f"Error processing {img_name}: {e}")
+                    if args.output == 'table':
+                        progress.console.print(f"[red]Error processing {img_name}: {e}[/red]")
                 
-                progress.advance(task)
+                if args.output == 'table':
+                    progress.advance(task)
             
             # Normal shutdown
             executor.shutdown(wait=True)
@@ -624,7 +696,12 @@ def main():
     collected_results.sort(key=lambda x: x[0])
     
     if not collected_results:
-        console.print("[yellow]No matching images or tags found.[/yellow]")
+        if args.output == 'table':
+            console.print("[yellow]No matching images or tags found.[/yellow]")
+        elif args.output == 'json':
+            print("[]")
+        logger.info("No matching images or tags found.")
+        return
 
     # --- Output Handling ---
 
