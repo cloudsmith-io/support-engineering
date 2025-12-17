@@ -58,7 +58,7 @@ logger = setup_logging()
 
 # --- Helper Functions ---
 
-def make_request(url, headers=None, method='GET', data=None):
+def make_request(url, headers=None, method='GET', data=None, return_headers=False):
     """Performs an HTTP request and returns parsed JSON. Handles rate limiting."""
     if headers is None:
         headers = {}
@@ -87,7 +87,12 @@ def make_request(url, headers=None, method='GET', data=None):
                 if method == 'DELETE':
                     logger.info(f"DELETE Success: {url}")
                     return True
-                return json.loads(response.read().decode('utf-8'))
+                
+                resp_data = json.loads(response.read().decode('utf-8'))
+                if return_headers:
+                    return resp_data, response.headers
+                return resp_data
+
         except urllib.error.HTTPError as e:
             if e.code == 429:
                 # Rate limited - wait and retry
@@ -422,28 +427,53 @@ def get_untagged_images(workspace, repo, img, delete=False, detailed=False):
     return groups
 
 def get_image_analysis(workspace, repo, img_name, delete_all=False, delete_tag=None, detailed=False):
-    tags_url = f"{CLOUDSMITH_URL}/v2/{workspace}/{repo}/{img_name}/tags/list"
-    tags_json = make_request(tags_url, {"Accept": "application/vnd.oci.image.manifest.v1+json", "Cache-Control": "no-cache"})
+    # Switch to Cloudsmith API to avoid upstream tags and allow filtering
+    api_url = f"https://api.cloudsmith.io/v1/packages/{workspace}/{repo}/"
     
-    tags = []
-    if tags_json:
-        raw_tags = find_key_recursive(tags_json, 'tags')
-        flat_tags = []
-        for item in raw_tags:
-            if isinstance(item, list):
-                flat_tags.extend(item)
-            else:
-                flat_tags.append(item)
+    # Construct query: format:docker AND name:{img_name} (if provided)
+    query_parts = ["format:docker"]
+    if img_name:
+        query_parts.append(f"name:{img_name}")
+    
+    query = urlencode({'query': " AND ".join(query_parts)})
+    next_url = f"{api_url}?{query}"
+    
+    tags = set()
+    
+    # Pagination Loop
+    while next_url:
+        result = make_request(next_url, {"Cache-Control": "no-cache"}, return_headers=True)
+        if not result:
+            break
+            
+        data, headers = result
         
-        tags = sorted(list(set(flat_tags)))
+        for pkg in data:
+            # pkg['tags'] is a dict like {'version': [...]}
+            version_tags = pkg.get('tags', {}).get('version', [])
+            for t in version_tags:
+                tags.add(t)
+        
+        # Handle Pagination via Link header
+        next_url = None
+        link_header = headers.get('Link')
+        if link_header:
+            links = link_header.split(',')
+            for link in links:
+                if 'rel="next"' in link:
+                    # Format: <url>; rel="next"
+                    next_url = link.split(';')[0].strip('<> ')
+                    break
 
-    if not tags:
+    sorted_tags = sorted(list(tags))
+
+    if not sorted_tags:
         logger.info(f"No tags found for image: {img_name}")
         return None
 
     groups = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_tag = {executor.submit(fetch_tag_data, workspace, repo, img_name, t, detailed): t for t in tags}
+        future_to_tag = {executor.submit(fetch_tag_data, workspace, repo, img_name, t, detailed): t for t in sorted_tags}
         
         results = {}
         for future in concurrent.futures.as_completed(future_to_tag):
@@ -453,7 +483,7 @@ def get_image_analysis(workspace, repo, img_name, delete_all=False, delete_tag=N
             except Exception:
                 pass
         
-        for t in tags:
+        for t in sorted_tags:
             if t in results:
                 groups.append(results[t])
 
