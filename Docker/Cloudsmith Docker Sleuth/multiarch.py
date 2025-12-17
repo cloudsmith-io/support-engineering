@@ -361,7 +361,7 @@ def fetch_untagged_data(pkg, workspace, repo, img, detailed=False):
         
     return results, slug
 
-def get_untagged_images(workspace, repo, img, delete=False, detailed=False):
+def get_untagged_images(workspace, repo, img, delete=False, detailed=False, progress=None):
     api_url = f"https://api.cloudsmith.io/v1/packages/{workspace}/{repo}/"
     query = urlencode({'query': f"name:{img}"})
     full_url = f"{api_url}?{query}"
@@ -385,6 +385,10 @@ def get_untagged_images(workspace, repo, img, delete=False, detailed=False):
     results_map = {}
     packages_to_delete = []
     
+    task_id = None
+    if progress:
+        task_id = progress.add_task(f"[cyan]Analyzing {img}[/cyan] ({len(untagged_pkgs)} untagged)", total=len(untagged_pkgs))
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(fetch_untagged_data, pkg, workspace, repo, img, detailed): i for i, pkg in enumerate(untagged_pkgs)}
         for future in concurrent.futures.as_completed(futures):
@@ -395,6 +399,12 @@ def get_untagged_images(workspace, repo, img, delete=False, detailed=False):
                 packages_to_delete.append(slug)
             except Exception:
                 pass
+            
+            if progress and task_id is not None:
+                progress.advance(task_id)
+    
+    if progress and task_id is not None:
+        progress.remove_task(task_id)
 
     # Perform Deletion if requested
     deleted_slugs = set()
@@ -426,7 +436,7 @@ def get_untagged_images(workspace, repo, img, delete=False, detailed=False):
     
     return groups
 
-def get_image_analysis(workspace, repo, img_name, delete_all=False, delete_tag=None, detailed=False):
+def get_image_analysis(workspace, repo, img_name, delete_all=False, delete_tag=None, detailed=False, progress=None):
     # Switch to Cloudsmith API to avoid upstream tags and allow filtering
     api_url = f"https://api.cloudsmith.io/v1/packages/{workspace}/{repo}/"
     
@@ -472,6 +482,11 @@ def get_image_analysis(workspace, repo, img_name, delete_all=False, delete_tag=N
         return None
 
     groups = []
+    
+    task_id = None
+    if progress:
+        task_id = progress.add_task(f"[cyan]Analyzing {img_name}[/cyan] ({len(sorted_tags)} tags)", total=len(sorted_tags))
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         future_to_tag = {executor.submit(fetch_tag_data, workspace, repo, img_name, t, detailed): t for t in sorted_tags}
         
@@ -482,10 +497,16 @@ def get_image_analysis(workspace, repo, img_name, delete_all=False, delete_tag=N
                 results[tag] = future.result()
             except Exception:
                 pass
+            
+            if progress and task_id is not None:
+                progress.advance(task_id)
         
         for t in sorted_tags:
             if t in results:
                 groups.append(results[t])
+    
+    if progress and task_id is not None:
+        progress.remove_task(task_id)
 
     # Deletion Logic for Tagged Images
     packages_to_delete = []
@@ -532,11 +553,11 @@ def get_image_analysis(workspace, repo, img_name, delete_all=False, delete_tag=N
 
     return groups
 
-def process_image(org, repo, img_name, args):
+def process_image(org, repo, img_name, args, progress=None):
     if args.untagged or args.untagged_delete:
-        return get_untagged_images(org, repo, img_name, delete=args.untagged_delete, detailed=args.detailed)
+        return get_untagged_images(org, repo, img_name, delete=args.untagged_delete, detailed=args.detailed, progress=progress)
     else:
-        return get_image_analysis(org, repo, img_name, delete_all=args.delete_all, delete_tag=args.delete_tag, detailed=args.detailed)
+        return get_image_analysis(org, repo, img_name, delete_all=args.delete_all, delete_tag=args.delete_tag, detailed=args.detailed, progress=progress)
 
 def render_table(image_name, groups, is_untagged=False, has_action=False):
     # --- Table Setup ---
@@ -679,24 +700,37 @@ def main():
             sys.exit(1)
 
     # Only show progress bar for table output
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        console=console
-    ) as progress:
-        task = progress.add_task(f"Processing {len(images_to_scan)} images...", total=len(images_to_scan))
-        
-        collected_results = []
+    if args.output == 'table':
+        progress_ctx = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            console=console
+        )
+    else:
+        # Dummy context manager for non-table output
+        class DummyProgress:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def add_task(self, *args, **kwargs): return None
+            def advance(self, *args, **kwargs): pass
+            def remove_task(self, *args, **kwargs): pass
+            @property
+            def console(self): return console # fallback
+        progress_ctx = DummyProgress()
 
+    collected_results = []
+
+    with progress_ctx as progress:
+        if args.output == 'table':
+            task = progress.add_task(f"Processing {len(images_to_scan)} images...", total=len(images_to_scan))
+        
         # Use a reasonable number of workers for images (e.g., 5)
-        # Each image might spawn its own threads for tags/digests
-        # Manually manage executor to handle KeyboardInterrupt gracefully
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
         try:
             future_to_img = {
-                executor.submit(process_image, args.org, args.repo, img, args): img 
+                executor.submit(process_image, args.org, args.repo, img, args, progress=progress): img 
                 for img in images_to_scan
             }
             
